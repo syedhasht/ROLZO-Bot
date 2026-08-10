@@ -1,0 +1,22 @@
+# Secrets — never committed. Set these as environment variables in Render's
+# dashboard instead when deploying.
+rolzo.local.env
+.env
+.env.*
+
+# Generated logs — grow large, contain booking/passenger details.
+logs.txt
+logs.txt.1
+rolzo-watcher.log
+rolzo-watcher.log.1
+watcher-stdout.log
+supervisor.log
+
+# Raw API captures — contain real customer PII (names, phone numbers,
+# payment card last4). Diagnostic only, never for version control.
+raw-captures/
+diag-*.json
+planned-sample.json
+partner-details.json
+
+node_modules/

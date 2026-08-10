@@ -1,0 +1,13 @@
+{
+  "name": "rolzo-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rolzo new-booking watcher / auto-accept client",
+  "main": "rolzo-auto-accept.js",
+  "scripts": {
+    "start": "node rolzo-auto-accept.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

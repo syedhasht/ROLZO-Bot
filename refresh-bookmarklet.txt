@@ -1,0 +1,26 @@
+ROLZO WATCHER — ONE-CLICK TOKEN REFRESH BOOKMARKLET
+=====================================================
+
+Setup (once):
+1. Show your browser's bookmarks bar (Ctrl+Shift+B in Chrome/Edge).
+2. Right-click the bookmarks bar -> Add page / New bookmark.
+3. Name it something like "Refresh Rolzo Token".
+4. Paste the ENTIRE line below as the URL/location, save.
+
+javascript:(function(){try{var raw=localStorage.getItem('RolzoCurrentUser');if(!raw){alert('Rolzo watcher: RolzoCurrentUser not found — are you logged in?');return;}var u=JSON.parse(raw);if(!u.authToken||!u.userId){alert('Rolzo watcher: authToken/userId missing from stored session.');return;}fetch('http://127.0.0.1:47823/update-creds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({authToken:u.authToken,userId:u.userId})}).then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});}).then(function(res){if(res.ok)alert('Rolzo watcher: credentials refreshed'+(res.j&&res.j.resumed?' — watcher resumed!':' ✅'));else alert('Rolzo watcher rejected the update: '+(res.j&&res.j.error));}).catch(function(e){alert('Could not reach the local watcher (is it running?): '+e.message);});}catch(e){alert('Rolzo watcher bookmarklet error: '+e.message);}})();
+
+How to use it:
+- The watcher script (rolzo-auto-accept.js) must be running — it listens on
+  http://127.0.0.1:47823, localhost-only, never reachable off this machine.
+- Whenever the watcher pauses on repeated auth failures (or just whenever
+  you want to pre-emptively refresh), open business.rolzo.com in a tab
+  where you're logged in, click the bookmark, and you'll get an alert
+  confirming success (and whether it resumed a paused watcher).
+- It reads your session's own authToken/userId directly from that page's
+  localStorage and sends only those two values to the local server — no
+  password, nothing else leaves your machine.
+- Behind the scenes this also rewrites rolzo.local.env, so a manual
+  restart later still has the fresh token too.
+
+What it does NOT do: log you into anything, read your password, or send
+anything anywhere except your own local watcher process on 127.0.0.1.
