@@ -107,6 +107,20 @@ const BIND_HOST = process.env.PORT ? '0.0.0.0' : '127.0.0.1'
 // already means nothing else on the machine's network can reach it).
 const REFRESH_SECRET = process.env.REFRESH_SECRET || null
 
+// Optional. Without these, a refreshed token updates the running process
+// (works immediately) and the local file (works if it's ever re-read from
+// disk) — but on Render specifically, the local file is on ephemeral
+// storage: it survives until the container restarts for ANY reason (a
+// future deploy, a crash, host maintenance), then reverts to whatever
+// ROLZO_AUTH_TOKEN is set to in Render's dashboard, which would be the
+// stale value from whenever the service was first configured. With these
+// two set, a refresh also calls Render's API to persist the new value as
+// the actual env var, so the NEXT restart boots up with it already correct
+// instead of immediately re-entering the auth-failure loop.
+const RENDER_API_KEY = process.env.RENDER_API_KEY || null
+const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID || null
+const RENDER_PERSIST_ENABLED = !!(RENDER_API_KEY && RENDER_SERVICE_ID)
+
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || null
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null
 const DISCORD_ENABLED = !!(DISCORD_BOT_TOKEN && DISCORD_CHANNEL_ID)
@@ -264,6 +278,9 @@ const EVENT_STYLE = {
   refresh_server_listening: { tag: '🔑 REFRESH SERVER UP', color: COLOR.cyan },
   refresh_server_error: { tag: '🔥 REFRESH SERVER ERROR', color: COLOR.red },
   refresh_unauthorized: { tag: '🚫 UNAUTHORIZED REFRESH ATTEMPT', color: COLOR.red },
+  render_env_persisted: { tag: '☁️  RENDER ENV SAVED', color: COLOR.cyan },
+  render_env_persist_failed: { tag: '⚠️  RENDER ENV SAVE FAILED', color: COLOR.red },
+  render_env_persist_error: { tag: '⚠️  RENDER ENV SAVE ERROR', color: COLOR.red },
   discord_command: { tag: '💬 DISCORD COMMAND', color: COLOR.cyan },
   discord_gateway_ready: { tag: '💬 DISCORD LISTENING', color: COLOR.cyan },
   discord_gateway_closed: { tag: '💬 DISCORD DISCONNECTED', color: COLOR.gray },
@@ -709,9 +726,24 @@ async function fetchSupplierId() {
       log('supplier_id_resolved', { supplierId: id, companyName: name })
     } else {
       log('supplier_id_missing', { status, response: json })
+      discordEmbed({
+        title: '⚠️ Could not resolve our supplier ID',
+        color: 0xc23b3b,
+        description:
+          `GET external/partner/{token} returned no usable _id (HTTP ${status}). Every partner-flow ` +
+          `booking (isForPartner: true) will be blocked from accepting until this resolves — check ` +
+          `ROLZO_PARTNER_TOKEN and credentials.`,
+      })
     }
   } catch (err) {
     log('supplier_id_error', { error: err.message })
+    discordEmbed({
+      title: '⚠️ Could not resolve our supplier ID',
+      color: 0xc23b3b,
+      description:
+        `Fetching our supplier ID errored: ${err.message}. Every partner-flow booking will be ` +
+        `blocked from accepting until this resolves.`,
+    })
   }
   return SUPPLIER_ID
 }
@@ -935,35 +967,44 @@ function resume(reason, onlyIfReason) {
   return true
 }
 
+// status: an HTTP status number (bad response — e.g. token invalid), or the
+// string 'network' for a request that never got a response at all (timeout,
+// DNS, connection reset). The two get different wording since "check your
+// token" is actively misleading advice for a network outage.
 function onPollFailure(status) {
   consecutiveFailures += 1
+  const isNetwork = status === 'network'
+  const statusLabel = isNetwork ? 'network error (timeout/connection failure)' : `HTTP ${status}`
+  const likelyCause = isNetwork
+    ? "Most likely cause: a network issue reaching Rolzo's servers, or Rolzo's API is down — probably not your token."
+    : 'Most likely cause: ROLZO_AUTH_TOKEN / ROLZO_USER_ID has expired or gone stale.'
 
   if (consecutiveFailures === FAILURE_WARN_THRESHOLD && !authAlertSent) {
     authAlertSent = true
     log('auth_alert_sent', { consecutiveFailures, status })
     discordEmbed({
-      title: '⚠️ Watcher may be stuck — check your token',
+      title: '⚠️ Watcher may be stuck',
       color: 0xc23b3b,
       description:
-        `${consecutiveFailures} polls in a row returned HTTP ${status} instead of 200.\n` +
-        `Most likely cause: ROLZO_AUTH_TOKEN / ROLZO_USER_ID in rolzo.local.env has expired ` +
-        `or gone stale. Still retrying — will pause automatically at ${FAILURE_HALT_THRESHOLD} ` +
-        `failures to avoid hammering Rolzo with a dead token. Click the refresh bookmarklet to ` +
-        `fix it instantly.`,
+        `${consecutiveFailures} polls in a row failed (${statusLabel}) instead of succeeding.\n` +
+        `${likelyCause} Still retrying — will pause automatically at ${FAILURE_HALT_THRESHOLD} ` +
+        `failures to avoid hammering Rolzo. ${isNetwork ? '' : 'Click the refresh bookmarklet to fix it instantly.'}`,
     })
   }
 
   if (consecutiveFailures >= FAILURE_HALT_THRESHOLD) {
     log('halted_after_repeated_failures', { consecutiveFailures, status })
     discordEmbed({
-      title: '🛑 Watcher PAUSED — repeated auth failures',
+      title: '🛑 Watcher PAUSED — repeated failures',
       color: 0xc23b3b,
       description:
-        `${consecutiveFailures} consecutive failed polls (last: HTTP ${status}). Paused polling ` +
+        `${consecutiveFailures} consecutive failed polls (last: ${statusLabel}). Paused polling ` +
         `so we don't hammer Rolzo's servers / risk this IP getting rate-limited or flagged.\n\n` +
-        `Fix: click the Rolzo token-refresh bookmarklet while logged in — it'll resume ` +
-        `automatically, no restart needed. Or send \`!start\` in Discord. Or manually update ` +
-        `rolzo.local.env and restart.`,
+        (isNetwork
+          ? `Send \`!start\` in Discord once you believe Rolzo/network access is back.`
+          : `Fix: click the Rolzo token-refresh bookmarklet while logged in — it'll resume ` +
+            `automatically, no restart needed. Or send \`!start\` in Discord. Or manually update ` +
+            `credentials and restart.`),
     })
     pause('auth', { consecutiveFailures, status })
   }
@@ -1040,7 +1081,12 @@ async function pollLoop() {
     try {
       await pollOnce()
     } catch (err) {
+      // Network-level failures (timeout, DNS, connection reset) never went
+      // through onPollFailure() before — only bad HTTP responses did — so
+      // this could repeat forever with zero Discord visibility. Route it
+      // through the same warn-at-3/pause-at-5 escalation instead.
       log('poll_error', { error: err.message })
+      onPollFailure('network')
     }
     const elapsed = Date.now() - t0
     const wait = Math.max(0, POLL_INTERVAL_MS - elapsed)
@@ -1049,12 +1095,14 @@ async function pollLoop() {
 }
 
 // ---- credential refresh server ----------------------------------------------
-// Localhost-only (bound to 127.0.0.1, never reachable off this machine). Lets
-// the token-refresh bookmarklet push a fresh authToken/userId here with one
-// click instead of manually editing rolzo.local.env and restarting. Updates
-// the in-memory credentials immediately, persists them to rolzo.local.env so
-// a future restart also has them, and resumes the poll loop right away if it
-// was paused waiting for exactly this.
+// Bound to 127.0.0.1 for local runs (unreachable off the machine — no auth
+// needed) or 0.0.0.0 + REFRESH_SECRET on Render (see BIND_HOST/REFRESH_SECRET
+// above). Lets the token-refresh bookmarklet push a fresh authToken/userId
+// here with one click instead of manually editing env vars and restarting.
+// Updates the in-memory credentials immediately, persists them (locally to
+// rolzo.local.env, and on Render also to the real env var via their API —
+// see persistToRenderEnv), and resumes the poll loop right away if it was
+// paused waiting for exactly this.
 
 function updateLocalEnvFile(updates) {
   const p = path.join(__dirname, 'rolzo.local.env')
@@ -1080,6 +1128,48 @@ function updateLocalEnvFile(updates) {
   }
 
   fs.writeFileSync(p, lines.join('\n'))
+}
+
+// Best-effort, fire-and-forget: persists a single env var to the actual
+// Render service config via their API, so it survives the container's NEXT
+// restart (this does not itself trigger a restart — confirmed against
+// Render's API docs — so it never interrupts the currently-running,
+// already-updated-in-memory process). Silently a no-op if RENDER_API_KEY /
+// RENDER_SERVICE_ID aren't set, which is the expected case for local runs.
+async function persistToRenderEnv(key, value) {
+  if (!RENDER_PERSIST_ENABLED) return
+  try {
+    const { status, raw } = await httpsJson({
+      host: 'api.render.com',
+      path: `/v1/services/${RENDER_SERVICE_ID}/env-vars/${key}`,
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${RENDER_API_KEY}` },
+      body: { value },
+    })
+    if (status >= 300) {
+      log('render_env_persist_failed', { key, status, body: raw.slice(0, 300) })
+      discordEmbed({
+        title: '⚠️ Token refreshed, but NOT protected against a Render restart',
+        color: 0xc23b3b,
+        description:
+          `The in-memory fix worked (still running fine right now) but saving ${key} to Render's ` +
+          `env vars failed (HTTP ${status}) — check RENDER_API_KEY / RENDER_SERVICE_ID. If Render ` +
+          `restarts before this is fixed, it'll boot with the OLD token and need another refresh.`,
+      })
+    } else {
+      log('render_env_persisted', { key })
+    }
+  } catch (err) {
+    log('render_env_persist_error', { key, error: err.message })
+    discordEmbed({
+      title: '⚠️ Token refreshed, but NOT protected against a Render restart',
+      color: 0xc23b3b,
+      description:
+        `The in-memory fix worked (still running fine right now) but saving ${key} to Render's env ` +
+        `vars errored: ${err.message}. If Render restarts before this is fixed, it'll boot with the ` +
+        `OLD token and need another refresh.`,
+    })
+  }
 }
 
 function startRefreshServer() {
@@ -1153,6 +1243,9 @@ function startRefreshServer() {
         AUTH_TOKEN = authToken
         USER_ID = userId
         updateLocalEnvFile({ ROLZO_AUTH_TOKEN: authToken, ROLZO_USER_ID: userId })
+        // Fire-and-forget — the response below shouldn't wait on Render's API.
+        persistToRenderEnv('ROLZO_AUTH_TOKEN', authToken)
+        persistToRenderEnv('ROLZO_USER_ID', userId)
 
         // onlyIfReason: 'auth' — a fresh token should not override a
         // deliberate "!stop"; that still needs an explicit "!start".
@@ -1234,8 +1327,25 @@ if (BIND_HOST === '0.0.0.0' && !REFRESH_SECRET) {
   process.exit(1)
 }
 
-process.on('uncaughtException', err => log('uncaught_exception', { error: err.message, stack: err.stack }))
-process.on('unhandledRejection', err => log('unhandled_rejection', { error: err && err.message }))
+process.on('uncaughtException', err => {
+  log('uncaught_exception', { error: err.message, stack: err.stack })
+  discordEmbed({
+    title: '🔥 Unexpected error — investigate',
+    color: 0xc23b3b,
+    description: `Something threw outside normal error handling and was caught only by the process-level ` +
+      `safety net: **${err.message}**\n\nThe watcher is still running, but this wasn't anticipated — ` +
+      `check the log for the full stack trace.`,
+  })
+})
+process.on('unhandledRejection', err => {
+  log('unhandled_rejection', { error: err && err.message })
+  discordEmbed({
+    title: '🔥 Unexpected error — investigate',
+    color: 0xc23b3b,
+    description: `An async operation rejected with no .catch(): **${(err && err.message) || err}**\n\n` +
+      `The watcher is still running, but this wasn't anticipated — check the log for details.`,
+  })
+})
 
 process.on('SIGINT', () => {
   log('shutdown', {})
