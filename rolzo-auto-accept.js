@@ -97,7 +97,15 @@ const PARTNER_TOKEN = process.env.ROLZO_PARTNER_TOKEN
 const PARTNER_TYPE = process.env.ROLZO_PARTNER_TYPE || 'chauffeur' // chauffeur | rental | meetGreet
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 10000)
 const DRY_RUN = process.env.DRY_RUN === '1'
-const REFRESH_SERVER_PORT = Number(process.env.REFRESH_SERVER_PORT || 47823)
+// Render (and most PaaS hosts) inject PORT and expect the app to bind it on
+// 0.0.0.0. Local dev has neither set, so it falls back to the old default
+// and stays 127.0.0.1-only (nothing off this machine can reach it).
+const REFRESH_SERVER_PORT = Number(process.env.PORT || process.env.REFRESH_SERVER_PORT || 47823)
+const BIND_HOST = process.env.PORT ? '0.0.0.0' : '127.0.0.1'
+// Required once this server is reachable from the internet — see the check
+// at the /update-creds handler for why. Optional locally (127.0.0.1-only
+// already means nothing else on the machine's network can reach it).
+const REFRESH_SECRET = process.env.REFRESH_SECRET || null
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || null
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null
@@ -255,6 +263,13 @@ const EVENT_STYLE = {
   resumed: { tag: '▶️  RESUMED', color: COLOR.green },
   refresh_server_listening: { tag: '🔑 REFRESH SERVER UP', color: COLOR.cyan },
   refresh_server_error: { tag: '🔥 REFRESH SERVER ERROR', color: COLOR.red },
+  refresh_unauthorized: { tag: '🚫 UNAUTHORIZED REFRESH ATTEMPT', color: COLOR.red },
+  discord_command: { tag: '💬 DISCORD COMMAND', color: COLOR.cyan },
+  discord_gateway_ready: { tag: '💬 DISCORD LISTENING', color: COLOR.cyan },
+  discord_gateway_closed: { tag: '💬 DISCORD DISCONNECTED', color: COLOR.gray },
+  discord_gateway_error: { tag: '⚠️  DISCORD GATEWAY ERROR', color: COLOR.red },
+  discord_command_error: { tag: '⚠️  DISCORD COMMAND ERROR', color: COLOR.red },
+  discord_gateway_reply_failed: { tag: '⚠️  DISCORD REPLY FAILED', color: COLOR.gray },
   creds_refreshed: { tag: '🔑 CREDS UPDATED', color: COLOR.green },
   creds_refresh_error: { tag: '⚠️  CREDS REFRESH FAILED', color: COLOR.red },
 }
@@ -291,10 +306,35 @@ function summarize(event, data) {
       return data.wasHalted ? 'watcher was paused — resuming polling now' : 'saved, watcher was already running fine'
     case 'resumed':
       return data.reason || ''
+    case 'paused':
+      return `${data.reason}${data.by ? ' (by ' + data.by + ')' : ''}`
+    case 'discord_command':
+      return `!${data.command} from ${data.by}`
+    case 'discord_gateway_closed':
+      return `code ${data.code}${data.code === 4014 ? ' — Message Content Intent not enabled in Discord Developer Portal' : ''}`
     default:
       return Object.keys(data).length ? JSON.stringify(data) : ''
   }
 }
+
+// Tracked here (not in the Discord Gateway section below) so log() can
+// update it regardless of load order — every event flows through log().
+const PROCESS_STARTED_AT = Date.now()
+let lastEventSummary = 'none yet'
+const SUMMARY_WORTHY_EVENTS = new Set([
+  'detected',
+  'accepted',
+  'accept_no_effect',
+  'accept_unverified',
+  'accept_rejected',
+  'accept_not_supported',
+  'accept_request_failed',
+  'accept_blocked_no_supplier_id',
+  'paused',
+  'resumed',
+  'halted_after_repeated_failures',
+  'creds_refreshed',
+])
 
 function log(event, data) {
   const t = nowDisplayTZ()
@@ -306,6 +346,12 @@ function log(event, data) {
   const style = EVENT_STYLE[event] || { tag: event, color: COLOR.gray }
   const detail = summarize(event, data)
   const plainTag = style.tag.replace(/^\W+\s*/, '') // strip the leading emoji for the plain-text file
+
+  // Feeds !status in Discord — only the events someone would actually care
+  // to see at a glance, not every heartbeat/poll-issue.
+  if (SUMMARY_WORTHY_EVENTS.has(event)) {
+    lastEventSummary = `${t.time} ${t.zone} — ${plainTag}${detail ? ': ' + detail : ''}`
+  }
 
   console.log(
     `${COLOR.dim}${t.time} ${t.zone}${COLOR.reset} ${style.color}${COLOR.bold}${style.tag}${COLOR.reset}${detail ? '  ' + detail : ''}`
@@ -467,6 +513,174 @@ function notifyAccepted(item, detailUrl, { won, reason, ms, verification }) {
         `\n\nNext step: assign a chauffeur to this booking in the app.`
       : `Did not get it (accept call took ${fmtSeconds(ms)}) — ${reason || 'unknown reason'}.`,
     fields,
+  })
+}
+
+// ---- Discord Gateway — listens for !start / !stop / !status ----------------
+// Everything above is outbound-only (plain REST POSTs). Receiving commands
+// needs the Gateway (a WebSocket), a different Discord API. Node 20+ has a
+// built-in WebSocket global (via undici), so this needs no dependency.
+//
+// Requires the bot's "Message Content Intent" to be turned ON in the Discord
+// Developer Portal (Bot tab -> Privileged Gateway Intents) — off by default,
+// and without it every message arrives with an empty .content no matter what
+// intents are requested here.
+
+function fmtDuration(ms) {
+  const s = Math.floor(ms / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${sec}s` : `${sec}s`
+}
+
+function sendChannelMessage(channelId, content) {
+  return httpsJson({
+    host: 'discord.com',
+    path: `/api/v10/channels/${channelId}/messages`,
+    method: 'POST',
+    headers: {
+      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      'User-Agent': 'RolzoBookingWatcher (local script, 1.0)',
+    },
+    body: { content },
+  }).catch(err => log('discord_gateway_reply_failed', { error: err.message }))
+}
+
+async function replyStatus(channelId) {
+  const t = nowDisplayTZ()
+  const stateLine =
+    pauseReason === 'manual'
+      ? '🛑 STOPPED (by !stop)'
+      : pauseReason === 'auth'
+      ? '🛑 PAUSED (repeated auth failures)'
+      : '✅ RUNNING'
+
+  const recentLog = fs.existsSync(TXT_LOG_FILE)
+    ? fs
+        .readFileSync(TXT_LOG_FILE, 'utf8')
+        .trim()
+        .split('\n')
+        .slice(-8)
+        .join('\n')
+    : '(no log file yet)'
+
+  const lines = [
+    `**${stateLine}**`,
+    `Mode: ${DRY_RUN ? 'DRY RUN (detects, does not accept)' : 'LIVE (auto-accepts)'}`,
+    `Now: ${t.full}`,
+    `Uptime: ${fmtDuration(Date.now() - PROCESS_STARTED_AT)}`,
+    `Successful polls: ${successfulPollCount}`,
+    `Supplier ID resolved: ${SUPPLIER_ID ? 'yes (' + SUPPLIER_ID + ')' : 'no'}`,
+    `Last activity: ${lastEventSummary}`,
+    '',
+    `Real log, last ${Math.min(8, recentLog.split('\n').length)} lines:`,
+    '```',
+    recentLog.length > 1800 ? recentLog.slice(-1800) : recentLog,
+    '```',
+  ]
+  await sendChannelMessage(channelId, lines.join('\n'))
+}
+
+async function handleDiscordMessage(msg) {
+  if (!msg.author || msg.author.bot) return // never react to bots, including ourselves
+  if (DISCORD_CHANNEL_ID && msg.channel_id !== DISCORD_CHANNEL_ID) return
+  const content = (msg.content || '').trim().toLowerCase()
+
+  if (content === '!status') {
+    log('discord_command', { command: 'status', by: msg.author.username })
+    await replyStatus(msg.channel_id)
+  } else if (content === '!stop') {
+    log('discord_command', { command: 'stop', by: msg.author.username })
+    const did = pause('manual', { by: msg.author.username })
+    await sendChannelMessage(
+      msg.channel_id,
+      did ? '🛑 Stopped. Will not poll or accept anything until `!start`.' : 'Already stopped.'
+    )
+  } else if (content === '!start') {
+    log('discord_command', { command: 'start', by: msg.author.username })
+    const did = resume(`discord !start by ${msg.author.username}`)
+    await sendChannelMessage(msg.channel_id, did ? '▶️ Started. Watching for new bookings again.' : 'Already running.')
+  }
+}
+
+const GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 15) // GUILDS, GUILD_MESSAGES, MESSAGE_CONTENT
+let gatewayWs = null
+let gatewayHeartbeatTimer = null
+let gatewaySeq = null
+let gatewayReconnectDelayMs = 2000
+
+function gatewayHeartbeat() {
+  if (gatewayWs && gatewayWs.readyState === WebSocket.OPEN) {
+    gatewayWs.send(JSON.stringify({ op: 1, d: gatewaySeq }))
+  }
+}
+
+function gatewayIdentify() {
+  gatewayWs.send(
+    JSON.stringify({
+      op: 2,
+      d: {
+        token: DISCORD_BOT_TOKEN,
+        intents: GATEWAY_INTENTS,
+        properties: { os: 'linux', browser: 'rolzo-watcher', device: 'rolzo-watcher' },
+      },
+    })
+  )
+}
+
+function connectDiscordGateway() {
+  if (!DISCORD_ENABLED) return
+  let ws
+  try {
+    ws = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json')
+  } catch (err) {
+    log('discord_gateway_error', { error: err.message })
+    setTimeout(connectDiscordGateway, gatewayReconnectDelayMs)
+    return
+  }
+  gatewayWs = ws
+
+  ws.addEventListener('message', event => {
+    let msg
+    try {
+      msg = JSON.parse(event.data)
+    } catch (e) {
+      return
+    }
+    const { op, d, s, t } = msg
+    if (s != null) gatewaySeq = s
+
+    if (op === 10) {
+      // HELLO: start heartbeating (with jitter, per Discord's docs), then identify.
+      const interval = d.heartbeat_interval
+      setTimeout(gatewayHeartbeat, interval * Math.random())
+      gatewayHeartbeatTimer = setInterval(gatewayHeartbeat, interval)
+      gatewayIdentify()
+    } else if (op === 0) {
+      // DISPATCH
+      if (t === 'READY') {
+        gatewayReconnectDelayMs = 2000
+        log('discord_gateway_ready', {})
+      } else if (t === 'MESSAGE_CREATE') {
+        handleDiscordMessage(d).catch(err => log('discord_command_error', { error: err.message }))
+      }
+    } else if (op === 7 || op === 9) {
+      // RECONNECT requested, or INVALID_SESSION — simplest correct response is
+      // a fresh reconnect+re-identify rather than implementing RESUME.
+      ws.close()
+    }
+  })
+
+  ws.addEventListener('close', event => {
+    clearInterval(gatewayHeartbeatTimer)
+    log('discord_gateway_closed', { code: event.code })
+    gatewayReconnectDelayMs = Math.min(gatewayReconnectDelayMs * 1.5, 30000)
+    setTimeout(connectDiscordGateway, gatewayReconnectDelayMs)
+  })
+
+  ws.addEventListener('error', err => {
+    log('discord_gateway_error', { error: (err && err.message) || 'unknown' })
   })
 }
 
@@ -676,22 +890,17 @@ async function acceptBooking(item) {
   }
 }
 
-// Distinguishes "no new bookings" (silence, expected) from "auth/token is
-// probably dead" (repeated non-200 responses) — the latter is silent
-// failure otherwise, which defeats the point of this whole script.
-//
-// At 3 in a row: one warning, still polling (could be a transient blip).
-// At 5 in a row: PAUSE polling entirely (distinct from `stopping`, which is
-// only for a real shutdown/SIGINT). A dead token means every poll from here
-// on is just a failed auth request hitting Rolzo's servers back to back —
-// the pattern that gets an IP rate-limited or flagged, for zero benefit
-// since a dead token was never going to start working again on its own.
-// The refresh server below can wake it back up the moment new credentials
-// arrive, without a manual restart.
+// ---- pause / resume ---------------------------------------------------------
+// One mechanism, two triggers: repeated auth failures pause it automatically,
+// and a Discord "!stop" pauses it on request. Both go through the same park
+// point in pollLoop — `pauseReason` records WHY so !status and the resume
+// logic can tell them apart. Deliberately separate from `stopping`, which is
+// only for a real process shutdown (SIGINT) — a pause keeps the process (and
+// the Discord/refresh listeners) alive, just idles the polling itself.
+let pauseReason = null // null = running; 'auth' | 'manual'
+let resumeResolver = null
 let consecutiveFailures = 0
 let authAlertSent = false
-let haltedForAuth = false
-let resumeResolver = null
 const FAILURE_WARN_THRESHOLD = 3
 const FAILURE_HALT_THRESHOLD = 5
 
@@ -701,12 +910,24 @@ function waitUntilResumed() {
   })
 }
 
-function resumeAfterHalt(reason) {
-  if (!haltedForAuth) return false
-  haltedForAuth = false
+function pause(reason, meta) {
+  if (pauseReason) return false // already paused for some reason
+  pauseReason = reason
+  log('paused', { reason, ...meta })
+  return true
+}
+
+// onlyIfReason: resume only clears a pause that matches this reason, so e.g.
+// a token refresh can't accidentally un-pause a deliberate "!stop" — only an
+// explicit "!start" (or another auth-fix) should do that.
+function resume(reason, onlyIfReason) {
+  if (!pauseReason) return false
+  if (onlyIfReason && pauseReason !== onlyIfReason) return false
+  const was = pauseReason
+  pauseReason = null
   consecutiveFailures = 0
   authAlertSent = false
-  log('resumed', { reason })
+  log('resumed', { reason, wasPausedFor: was })
   if (resumeResolver) {
     resumeResolver()
     resumeResolver = null
@@ -741,9 +962,10 @@ function onPollFailure(status) {
         `${consecutiveFailures} consecutive failed polls (last: HTTP ${status}). Paused polling ` +
         `so we don't hammer Rolzo's servers / risk this IP getting rate-limited or flagged.\n\n` +
         `Fix: click the Rolzo token-refresh bookmarklet while logged in — it'll resume ` +
-        `automatically, no restart needed. Or manually update rolzo.local.env and restart.`,
+        `automatically, no restart needed. Or send \`!start\` in Discord. Or manually update ` +
+        `rolzo.local.env and restart.`,
     })
-    haltedForAuth = true
+    pause('auth', { consecutiveFailures, status })
   }
 }
 
@@ -810,8 +1032,8 @@ let stopping = false
 
 async function pollLoop() {
   while (!stopping) {
-    if (haltedForAuth) {
-      await waitUntilResumed() // parks here with zero requests sent until refreshed
+    if (pauseReason) {
+      await waitUntilResumed() // parks here with zero requests sent until resumed
       continue
     }
     const t0 = Date.now()
@@ -863,6 +1085,23 @@ function updateLocalEnvFile(updates) {
 function startRefreshServer() {
   return new Promise(resolve => {
   const server = http.createServer((req, res) => {
+    // GET /health — unauthenticated on purpose: this is what Render's own
+    // health check and whatever external uptime pinger you point at this
+    // service hit to keep it from spinning down. No credentials, no state
+    // change, nothing worth protecting.
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          state: pauseReason ? `paused:${pauseReason}` : 'running',
+          dryRun: DRY_RUN,
+          uptimeSeconds: Math.floor((Date.now() - PROCESS_STARTED_AT) / 1000),
+        })
+      )
+      return
+    }
+
     // Only Rolzo's own origin is allowed to actually complete the POST (the
     // CORS preflight below blocks anything else at the browser level before
     // it ever reaches this handler).
@@ -871,7 +1110,7 @@ function startRefreshServer() {
 
     res.setHeader('Access-Control-Allow-Origin', allowOrigin)
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Refresh-Secret')
     res.setHeader('Access-Control-Allow-Private-Network', 'true') // Chrome Private Network Access preflight
 
     if (req.method === 'OPTIONS') {
@@ -883,6 +1122,20 @@ function startRefreshServer() {
     if (req.method !== 'POST' || req.url !== '/update-creds') {
       res.writeHead(404, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'not found' }))
+      return
+    }
+
+    // CORS only stops a *browser* from completing a cross-origin request —
+    // it does nothing against a direct curl/script. That's an acceptable gap
+    // when this only ever binds 127.0.0.1 (nothing off the machine can reach
+    // it at all), but once this is internet-facing (Render), it's the only
+    // thing standing between "anyone who finds the URL" and hijacking the
+    // account this bot acts as. REFRESH_SECRET closes that gap; only skipped
+    // when explicitly unset, which is the accepted local-dev-only tradeoff.
+    if (REFRESH_SECRET && req.headers['x-refresh-secret'] !== REFRESH_SECRET) {
+      log('refresh_unauthorized', { ip: req.socket.remoteAddress })
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
 
@@ -901,7 +1154,9 @@ function startRefreshServer() {
         USER_ID = userId
         updateLocalEnvFile({ ROLZO_AUTH_TOKEN: authToken, ROLZO_USER_ID: userId })
 
-        const wasHalted = resumeAfterHalt('credentials refreshed via bookmarklet')
+        // onlyIfReason: 'auth' — a fresh token should not override a
+        // deliberate "!stop"; that still needs an explicit "!start".
+        const wasHalted = resume('credentials refreshed via bookmarklet', 'auth')
         log('creds_refreshed', { wasHalted })
         discordEmbed({
           title: '🔑 Credentials refreshed',
@@ -921,8 +1176,8 @@ function startRefreshServer() {
     })
   })
 
-    server.listen(REFRESH_SERVER_PORT, '127.0.0.1', () => {
-      log('refresh_server_listening', { port: REFRESH_SERVER_PORT })
+    server.listen(REFRESH_SERVER_PORT, BIND_HOST, () => {
+      log('refresh_server_listening', { port: REFRESH_SERVER_PORT, host: BIND_HOST, authRequired: !!REFRESH_SECRET })
       resolve()
     })
 
@@ -966,6 +1221,19 @@ async function main() {
   }
 }
 
+// Refuse to boot in the one genuinely dangerous configuration: bound to all
+// interfaces (i.e. reachable from the internet, as on Render) with no
+// REFRESH_SECRET — that would let anyone who finds the URL POST arbitrary
+// credentials to /update-creds and hijack which Rolzo account this bot acts
+// as. Fine locally (127.0.0.1 bind already means nothing else can reach it).
+if (BIND_HOST === '0.0.0.0' && !REFRESH_SECRET) {
+  console.error(
+    'Refusing to start: bound to 0.0.0.0 (internet-facing) with no REFRESH_SECRET set.\n' +
+      'Set REFRESH_SECRET to a long random value in your environment variables before deploying.'
+  )
+  process.exit(1)
+}
+
 process.on('uncaughtException', err => log('uncaught_exception', { error: err.message, stack: err.stack }))
 process.on('unhandledRejection', err => log('unhandled_rejection', { error: err && err.message }))
 
@@ -996,6 +1264,7 @@ if (DISCORD_ENABLED) {
 // single-instance lock, so nothing else should run until we know we are the
 // only copy. Otherwise a duplicate would poll (and possibly accept) during
 // the window before its EADDRINUSE fires.
+connectDiscordGateway()
 startRefreshServer()
   .then(fetchSupplierId) // resolve supplierId up front; mid-race lookups cost time we don't have
   .then(main)
