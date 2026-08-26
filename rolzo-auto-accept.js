@@ -500,19 +500,134 @@ function notifySkipped(item, detailUrl, remainingSkips) {
       (remainingSkips > 0
         ? `${remainingSkips} more skip${remainingSkips === 1 ? '' : 's'} queued.`
         : `0 more skips queued — back to normal auto-accept.`),
+    // Full detail deliberately — a skipped booking is the one case where you
+    // can't see the outcome in Rolzo afterwards (it just goes to someone
+    // else), so the notification has to carry everything needed to judge
+    // whether skipping it was the right call.
     fields: [
+      { name: 'Service', value: serviceLabel(item) || 'n/a', inline: true },
       { name: 'Vehicle', value: `${item.vehicleBrand || ''} ${item.vehicleModel || ''}`.trim() || 'n/a', inline: true },
-      { name: 'Pick-up (as shown in Rolzo, UTC)', value: item.pickUpDate ? new Date(item.pickUpDate).toUTCString() : 'n/a', inline: true },
       { name: 'Price', value: item.dispatchPrice != null ? `${item.dispatchPrice} ${item.dispatchCurrency || ''}` : 'n/a', inline: true },
-      { name: 'Flow', value: item.isForPartner ? 'partner (company accept)' : item.isForDriver ? 'driver (one-click)' : 'unknown', inline: true },
+      { name: 'Pick-up (as shown in Rolzo, UTC)', value: item.pickUpDate ? new Date(item.pickUpDate).toUTCString() : 'n/a', inline: true },
+      { name: 'Extent', value: jobExtent(item) || 'n/a', inline: true },
+      { name: 'Passengers', value: paxSummary(item) || 'n/a', inline: true },
       { name: 'From', value: (item.pickUpLocation && item.pickUpLocation.fullAddress) || 'n/a' },
-      { name: 'To', value: (item.dropOffLocation && item.dropOffLocation.fullAddress) || 'n/a' },
+      ...(stopsLabel(item) ? [{ name: 'Stops', value: stopsLabel(item) }] : []),
+      { name: 'To', value: dropOffLabel(item) },
+      ...(flightLabel(item) ? [{ name: 'Flight', value: flightLabel(item), inline: true }] : []),
+      { name: 'Flow', value: item.isForPartner ? 'partner (company accept)' : item.isForDriver ? 'driver (one-click)' : 'unknown', inline: true },
     ],
   })
 }
 
 // dispatchedAt is when the offer actually landed with us; everything else
 // (dispatchDate/autoDispatched) relates to earlier dispatch stages.
+// tripInfo.distance is metres and tripInfo.duration is seconds — confirmed
+// against a real booking (#208829-R: duration 5494 -> "1 h 31 min" and
+// distance 116965 -> ~72.7 mi, both matching what Rolzo's own UI displayed
+// for that trip). Shown in miles since this account operates in the US and
+// Rolzo's detail payload reports unitSystem "MILES".
+function tripSummary(item) {
+  const t = item.tripInfo
+  if (!t) return null
+  const parts = []
+  if (typeof t.distance === 'number') parts.push(`${(t.distance / 1609.344).toFixed(1)} mi`)
+  if (typeof t.duration === 'number') {
+    // floor, not round — matches how Rolzo's own UI renders the same value
+    // (5494s shows as "1 h 31 min" there), so the numbers never disagree.
+    const mins = Math.floor(t.duration / 60)
+    const h = Math.floor(mins / 60)
+    const m = mins % 60
+    parts.push(h > 0 ? `${h}h ${m}m` : `${m}m`)
+  }
+  return parts.length ? parts.join(' · ') : null
+}
+
+function paxSummary(item) {
+  const p = item.passengerInfo
+  if (!p) return null
+  const parts = []
+  if (p.passenger != null) parts.push(`${p.passenger} pax`)
+  if (p.luggage != null) parts.push(`${p.luggage} bags`)
+  return parts.length ? parts.join(' · ') : null
+}
+
+// e.g. "airport_transfer" -> "Airport transfer"
+// Labels lifted verbatim from Rolzo's own bundle so the notification never
+// disagrees with what the same job is called inside their app. Note their
+// naming isn't literal: `airport_transfer` displays as just "Transfer", and
+// `chauffeur_services` as "By the hour" — prettifying the raw enum would get
+// both wrong. Unknown/new types fall back to a readable version of the enum
+// rather than showing nothing.
+const SERVICE_LABELS = {
+  airport_transfer: 'Transfer',
+  departure_transfer: 'Transfer',
+  return_transfer: 'Transfer',
+  transfer: 'Transfer',
+  chauffeur_services: 'By the hour',
+  chauffeur: 'By the hour',
+  car_rentals: 'Car rental',
+  meet_and_greet: 'VIP Meet & Greet',
+  vip_meet_greet: 'VIP Meet & Greet',
+  meet_and_greet_arrival: 'VIP Meet & Greet, Arrival',
+  vip_meet_greet_arrival: 'VIP Meet & Greet, Arrival',
+  meet_and_greet_departure: 'VIP Meet & Greet, Departure',
+  vip_meet_greet_departure: 'VIP Meet & Greet, Departure',
+  vip_meet_greet_transit: 'VIP Meet & Greet, Transit',
+}
+
+function serviceLabel(item) {
+  if (!item.type) return null
+  if (SERVICE_LABELS[item.type]) return SERVICE_LABELS[item.type]
+  const s = String(item.type).replace(/_/g, ' ')
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+// What the job actually consists of, which differs by service type:
+//   daily         -> "3 days" (the `days` array, not a single route)
+//   by-the-hour   -> "4 hours" (time-based; distance is not the point)
+//   everything else -> distance + drive time from tripInfo
+// Falls through gracefully when a type carries none of these.
+function jobExtent(item) {
+  if (item.durationType === 'daily' && Array.isArray(item.days) && item.days.length) {
+    return `${item.days.length} day${item.days.length === 1 ? '' : 's'}`
+  }
+  const isHourly = item.type === 'chauffeur_services' || item.type === 'chauffeur'
+  if (isHourly && item.duration != null) {
+    return `${item.duration} hour${Number(item.duration) === 1 ? '' : 's'}`
+  }
+  return tripSummary(item)
+}
+
+// By-the-hour jobs frequently have no drop-off at all — the vehicle stays
+// with the passenger. Saying "n/a" there reads like missing data; naming the
+// actual arrangement is the honest rendering.
+function dropOffLabel(item) {
+  if (item.dropOffLocation && item.dropOffLocation.fullAddress) return item.dropOffLocation.fullAddress
+  const isHourly = item.type === 'chauffeur_services' || item.type === 'chauffeur'
+  if (isHourly) return '(no fixed drop-off — by the hour)'
+  return 'n/a'
+}
+
+// Intermediate stops exist on multi-stop jobs; omitted entirely when there
+// are none rather than rendering an empty field.
+function stopsLabel(item) {
+  if (!Array.isArray(item.stops) || !item.stops.length) return null
+  return item.stops
+    .map(s => {
+      const addr = (s.location && s.location.fullAddress) || 'unknown stop'
+      const dur = s.duration && s.duration.label ? ` (${s.duration.label})` : ''
+      return `• ${addr}${dur}`
+    })
+    .join('\n')
+}
+
+function flightLabel(item) {
+  const info = item.airportDropOffInfo || item.airportPickUpInfo
+  if (!info || !info.flightNumber) return null
+  return `${info.flightNumber}${info.terminal ? ` · Terminal ${info.terminal}` : ''}`
+}
+
 function postedAtSource(item) {
   const raw = item.dispatchedAt || item.dispatchDate || item.autoDispatched || null
   if (!raw) return null
