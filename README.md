@@ -135,6 +135,17 @@ with empty content):
 - `!stop` — pauses polling (reason `'manual'`). Does not kill the process —
   it keeps listening so it can hear `!start` afterward.
 - `!start` — resumes, whatever the pause reason was.
+- `!skip` — stacking counter, not a toggle. Each `!skip` adds 1. While the
+  counter is above 0, the *next* booking this process sees (any flow —
+  partner, driver, or unknown) is not accepted at all — it's reported to
+  Discord as skipped, with full booking details, and the counter drops by
+  one. Hits 0 → the very next booking after that goes through completely
+  normal auto-accept, no lingering effect.
+- `!unskip` — the reverse, one at a time: decrements the counter by 1 (floor
+  0). Says so if there was nothing queued to remove.
+
+Both `!skip` and `!unskip` reply with the resulting count so it's never
+ambiguous how many are queued, and the count also shows in `!status`.
 
 Commands only act on messages in `DISCORD_CHANNEL_ID`, from non-bot authors.
 

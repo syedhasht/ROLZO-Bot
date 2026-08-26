@@ -254,6 +254,7 @@ const EVENT_STYLE = {
   accept_rejected: { tag: '❌ MISSED', color: COLOR.red },
   accept_no_effect: { tag: '❌ NOT WON', color: COLOR.red },
   accept_not_supported: { tag: '🙋 MANUAL ACTION NEEDED', color: COLOR.yellow },
+  skipped_by_request: { tag: '⏭️  SKIPPED', color: COLOR.gray },
   accept_attempt: { tag: '⚡ ACCEPTING', color: COLOR.cyan },
   accept_unverified: { tag: '❓ UNVERIFIED — CHECK MANUALLY', color: COLOR.yellow },
   accept_blocked_no_supplier_id: { tag: '🛑 ACCEPT BLOCKED', color: COLOR.red },
@@ -329,6 +330,8 @@ function summarize(event, data) {
       return `!${data.command} from ${data.by}`
     case 'discord_gateway_closed':
       return `code ${data.code}${data.code === 4014 ? ' — Message Content Intent not enabled in Discord Developer Portal' : ''}`
+    case 'skipped_by_request':
+      return `#${data.number ?? data.bookingId} — ${data.vehicle || 'n/a'} — ${data.remainingSkips} more skip${data.remainingSkips === 1 ? '' : 's'} queued`
     default:
       return Object.keys(data).length ? JSON.stringify(data) : ''
   }
@@ -351,6 +354,7 @@ const SUMMARY_WORTHY_EVENTS = new Set([
   'resumed',
   'halted_after_repeated_failures',
   'creds_refreshed',
+  'skipped_by_request',
 ])
 
 function log(event, data) {
@@ -486,6 +490,27 @@ function notifyPosted(item, detailUrl) {
   })
 }
 
+function notifySkipped(item, detailUrl, remainingSkips) {
+  discordEmbed({
+    title: `⏭️ SKIPPED (by request) — #${item.number || item._id}`,
+    url: detailUrl,
+    color: 0x8b959e, // neutral grey — deliberate, not a win/loss/error
+    description:
+      `Seen on the New Bookings feed, not accepted — skipped by request.\n` +
+      (remainingSkips > 0
+        ? `${remainingSkips} more skip${remainingSkips === 1 ? '' : 's'} queued.`
+        : `0 more skips queued — back to normal auto-accept.`),
+    fields: [
+      { name: 'Vehicle', value: `${item.vehicleBrand || ''} ${item.vehicleModel || ''}`.trim() || 'n/a', inline: true },
+      { name: 'Pick-up (as shown in Rolzo, UTC)', value: item.pickUpDate ? new Date(item.pickUpDate).toUTCString() : 'n/a', inline: true },
+      { name: 'Price', value: item.dispatchPrice != null ? `${item.dispatchPrice} ${item.dispatchCurrency || ''}` : 'n/a', inline: true },
+      { name: 'Flow', value: item.isForPartner ? 'partner (company accept)' : item.isForDriver ? 'driver (one-click)' : 'unknown', inline: true },
+      { name: 'From', value: (item.pickUpLocation && item.pickUpLocation.fullAddress) || 'n/a' },
+      { name: 'To', value: (item.dropOffLocation && item.dropOffLocation.fullAddress) || 'n/a' },
+    ],
+  })
+}
+
 // dispatchedAt is when the offer actually landed with us; everything else
 // (dispatchDate/autoDispatched) relates to earlier dispatch stages.
 function postedAtSource(item) {
@@ -589,6 +614,7 @@ async function replyStatus(channelId) {
     `Uptime: ${fmtDuration(Date.now() - PROCESS_STARTED_AT)}`,
     `Successful polls: ${successfulPollCount}`,
     `Supplier ID resolved: ${SUPPLIER_ID ? 'yes (' + SUPPLIER_ID + ')' : 'no'}`,
+    `Skip queue: ${skipCount === 0 ? 'none' : `${skipCount} upcoming booking${skipCount === 1 ? '' : 's'} will be skipped`}`,
     `Last activity: ${lastEventSummary}`,
     '',
     `Real log, last ${Math.min(8, recentLog.split('\n').length)} lines:`,
@@ -618,6 +644,26 @@ async function handleDiscordMessage(msg) {
     log('discord_command', { command: 'start', by: msg.author.username })
     const did = resume(`discord !start by ${msg.author.username}`)
     await sendChannelMessage(msg.channel_id, did ? '▶️ Started. Watching for new bookings again.' : 'Already running.')
+  } else if (content === '!skip') {
+    skipCount += 1
+    log('discord_command', { command: 'skip', by: msg.author.username, skipCount })
+    await sendChannelMessage(
+      msg.channel_id,
+      `⏭️ Will skip the next ${skipCount} upcoming booking${skipCount === 1 ? '' : 's'} (see them, won't accept them).`
+    )
+  } else if (content === '!unskip') {
+    log('discord_command', { command: 'unskip', by: msg.author.username, skipCount })
+    if (skipCount === 0) {
+      await sendChannelMessage(msg.channel_id, 'Nothing queued to skip already.')
+    } else {
+      skipCount -= 1
+      await sendChannelMessage(
+        msg.channel_id,
+        skipCount === 0
+          ? '⏮️ Nothing queued anymore — back to normal auto-accept.'
+          : `⏮️ Will skip the next ${skipCount} upcoming booking${skipCount === 1 ? '' : 's'}.`
+      )
+    }
   }
 }
 
@@ -936,6 +982,14 @@ let authAlertSent = false
 const FAILURE_WARN_THRESHOLD = 3
 const FAILURE_HALT_THRESHOLD = 5
 
+// !skip / !unskip — a stacking counter, not a toggle. Every booking this
+// process sees (any flow — partner, driver, or unknown) consumes one
+// credit when the counter is above 0: no accept attempt at all, just a
+// notification saying so. Deliberately separate from pause/resume — the
+// watcher keeps polling and reporting normally, it just declines to act
+// on the next N bookings specifically.
+let skipCount = 0
+
 function waitUntilResumed() {
   return new Promise(resolve => {
     resumeResolver = resolve
@@ -1045,6 +1099,23 @@ async function pollOnce() {
     const detailUrl = `${DETAIL_URL_BASE}/${PARTNER_TOKEN}/${item._id}`
     dumpRaw(`${item._id}-detected`, item)
     beep()
+
+    // !skip queue takes priority over everything else — every booking seen
+    // here consumes one credit while the counter is above 0, regardless of
+    // flow type, with no accept attempt at all.
+    if (skipCount > 0) {
+      skipCount -= 1
+      log('skipped_by_request', {
+        bookingId: item._id,
+        number: item.number,
+        vehicle: `${item.vehicleBrand || ''} ${item.vehicleModel || ''}`.trim(),
+        flow: item.isForPartner ? 'partner' : item.isForDriver ? 'driver' : 'unknown',
+        remainingSkips: skipCount,
+      })
+      notifySkipped(item, detailUrl, skipCount)
+      continue
+    }
+
     log('detected', {
       bookingId: item._id,
       number: item.number,
